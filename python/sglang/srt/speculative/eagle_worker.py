@@ -1,6 +1,7 @@
+import json
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -130,6 +131,30 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        # Pre-parse multi-profile config to determine profile count.
+        # KV cache layers will be extended AFTER pool creation in _init_draft_profiles.
+        self._num_draft_profiles = 1
+        self._draft_profiles_config = None
+        if (
+            self.speculative_algorithm.is_eagle3()
+            and server_args.speculative_draft_model_config is not None
+        ):
+            try:
+                with open(server_args.speculative_draft_model_config, "r") as f:
+                    self._draft_profiles_config = json.load(f)
+                n_profiles = len(self._draft_profiles_config.get("profiles", {}))
+                if n_profiles > 1:
+                    self._num_draft_profiles = n_profiles
+                    logger.info(
+                        f"Multi-profile EAGLE3: detected {n_profiles} profiles, "
+                        f"KV cache layers will be extended after pool creation"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to pre-parse multi-profile config: {e}. "
+                    "Falling back to single-profile."
+                )
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
@@ -197,6 +222,157 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        # Multi-profile draft model support
+        self._init_draft_profiles(server_args)
+
+    def _init_draft_profiles(self, server_args: ServerArgs):
+        """Initialize MoE-style multi-expert draft model for per-request routing.
+
+        Creates N expert sub-modules (fc, midlayer, norm, lm_head) inside the model.
+        Each expert's midlayer uses a unique layer_id for independent KV cache.
+        The default expert shares weights with the base model.
+        Additional experts' weights are loaded from separate checkpoints.
+
+        This implements a true MoE-style parallel architecture where all experts
+        can process tokens simultaneously, and a router selects per-token outputs.
+        """
+        if self._draft_profiles_config is None or self._num_draft_profiles <= 1:
+            return
+
+        profiles_config = self._draft_profiles_config
+        default_profile_name = profiles_config.get("default_profile", "default")
+        profiles = profiles_config.get("profiles", {})
+
+        if not profiles:
+            logger.warning("No profiles found in config file. Skipping multi-expert init.")
+            return
+
+        model = self.draft_model_runner.model
+
+        # Build ordered profile list with default at a known index
+        profile_names = []
+        default_idx = -1
+        for name in profiles.keys():
+            if name == default_profile_name:
+                default_idx = len(profile_names)
+            profile_names.append(name)
+
+        if default_idx < 0:
+            # Default profile not in the profiles dict, prepend it
+            profile_names.insert(0, default_profile_name)
+            default_idx = 0
+
+        n = len(profile_names)
+        logger.info(
+            f"Initializing MoE-style multi-expert EAGLE3 with {n} experts: "
+            f"{profile_names}, default='{default_profile_name}' (idx={default_idx})"
+        )
+
+        # Step 1: Register expert sub-modules in the model
+        # This creates N copies of fc, midlayer, norm, lm_head
+        # Default expert reuses existing weights, others are new instances
+        model.register_experts(
+            profile_names=profile_names,
+            default_profile_idx=default_idx,
+        )
+
+        # Step 2: Load weights for non-default experts
+        for i, profile_name in enumerate(profile_names):
+            if i == default_idx:
+                logger.info(f"Expert {i} ('{profile_name}'): uses already-loaded default weights")
+                continue
+
+            profile_cfg = profiles.get(profile_name, {})
+            draft_model_path = profile_cfg.get("draft_model_path")
+            if draft_model_path is None:
+                logger.warning(
+                    f"Expert {i} ('{profile_name}'): no draft_model_path, using default weights"
+                )
+                default_weights = model._extract_own_profile_weights()
+                model.load_expert_weights(i, default_weights)
+                continue
+
+            logger.info(
+                f"Loading expert {i} ('{profile_name}') from {draft_model_path}"
+            )
+            weights = self._load_profile_weights(draft_model_path, server_args)
+            if weights is not None:
+                model.load_expert_weights(i, weights)
+                logger.info(f"Expert {i} ('{profile_name}'): weights loaded successfully")
+            else:
+                logger.error(
+                    f"Expert {i} ('{profile_name}'): failed to load weights, using default"
+                )
+                default_weights = model._extract_own_profile_weights()
+                model.load_expert_weights(i, default_weights)
+
+        # Step 3: Extend KV cache pool with additional layers for extra experts.
+        # The base model was loaded with num_hidden_layers=1, so the KV cache pool
+        # has only 1 layer (layer_id=0). Each non-default expert needs its own
+        # layer_id for independent KV cache. We extend the pool here AFTER creation.
+        extra_layers = n - 1  # default expert reuses layer_id=0
+        if extra_layers > 0:
+            kv_pool = self.draft_model_runner.token_to_kv_pool
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            if isinstance(kv_pool, MHATokenToKVPool):
+                kv_pool.extend_layers(extra_layers)
+                logger.info(
+                    f"Extended draft KV cache pool by {extra_layers} layers "
+                    f"for {n} expert midlayers (total layers: {kv_pool.layer_num})"
+                )
+            else:
+                logger.warning(
+                    f"Cannot extend KV cache pool of type {type(kv_pool).__name__}. "
+                    f"Multi-expert may not work correctly."
+                )
+
+    def _load_profile_weights(
+        self, draft_model_path: str, server_args: ServerArgs
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Load a new set of draft model weights from a given path.
+
+        Creates a temporary model instance, loads weights, extracts profile-specific
+        parameter tensors (cloned), then deletes the temporary model entirely.
+        """
+        from sglang.srt.configs.device_config import DeviceConfig
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_loader import get_model
+
+        try:
+            # Create model config for the new profile
+            temp_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+
+            load_config = LoadConfig(
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
+            )
+
+            # Load the model
+            temp_model = get_model(
+                model_config=temp_model_config,
+                load_config=load_config,
+                device_config=DeviceConfig(self.device, self.gpu_id),
+            )
+
+            # Extract profile-specific weights (cloned tensors)
+            weights = temp_model._extract_own_profile_weights()
+
+            # Delete the entire temporary model to free GPU memory
+            del temp_model
+            torch.cuda.empty_cache()
+
+            return weights
+
+        except Exception as e:
+            logger.error(f"Failed to load draft profile from {draft_model_path}: {e}")
+            return None
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
