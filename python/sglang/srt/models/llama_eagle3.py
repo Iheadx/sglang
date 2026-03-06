@@ -20,6 +20,7 @@ from sglang.srt.utils import add_prefix
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 import copy
+import itertools
 import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -164,12 +165,19 @@ class LlamaModel(nn.Module):
     ):
         """Create N expert copies of fc, midlayer, norm for MoE-style parallel routing.
 
-        Each midlayer expert uses a different layer_id (0, 1, 2, ...)
-        so they have independent KV caches.
+        Each expert midlayer uses a distinct ``layer_id`` (0, 1, …) so that
+        it has its own independent KV cache layer.  The worker must call
+        ``extend_layers(N - 1)`` on the KV pool **before** CUDA graph
+        capture to allocate the additional layers.
 
-        The default expert (at default_profile_idx) shares weights with
-        self.fc / self.midlayer / self.norm (layer_id=0).
-        Other experts are new instances with different layer_ids.
+        In ``_forward_moe`` each expert processes **only** its own subset
+        of tokens through FC → midlayer (attention + MLP) → norm, which
+        is correct because:
+
+        * Attention metadata (``kv_indptr`` / ``kv_indices``) is rebuilt
+          on-the-fly for the subset.
+        * Each expert's KV cache layer is isolated, so writes from
+          different experts never collide.
         """
         n = len(profile_names)
         if n <= 1:
@@ -191,7 +199,7 @@ class LlamaModel(nn.Module):
                 mid_list.append(self.midlayer)
                 norm_list.append(self.norm)
             else:
-                # Create new instances with unique layer_id
+                # Create new instances with unique layer_id for independent KV cache
                 new_fc = torch.nn.Linear(
                     self.hidden_size_in * 3,
                     config.hidden_size,
@@ -222,8 +230,8 @@ class LlamaModel(nn.Module):
         self.norm_experts = nn.ModuleList(norm_list)
 
         logger.info(
-            f"Registered {n} MoE experts for profiles: {profile_names}, "
-            f"default_idx={default_profile_idx}"
+            f"Registered {n} MoE experts (independent KV cache layers) "
+            f"for profiles: {profile_names}, default_idx={default_profile_idx}"
         )
 
     def _get_profile_ids(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
@@ -279,13 +287,6 @@ class LlamaModel(nn.Module):
         )
 
         # Expand from per-request to per-token
-        # In draft decode, tokens are organized as: [req0_tok0, req0_tok1, ..., req1_tok0, ...]
-        # with topk tokens per request. The pattern depends on how tokens are laid out.
-        # In EAGLE3 draft, topk tokens per request are interleaved:
-        # after select_top_k_tokens, shape is [batch_size * topk].
-        # The repeat_interleave in eagle_worker maps positions as:
-        #   positions = seq_lens.repeat_interleave(topk)
-        # So tokens are grouped by request.
         if num_tokens == num_reqs:
             # 1:1 mapping (e.g. draft extend or prefill)
             return req_profile_tensor
@@ -328,6 +329,19 @@ class LlamaModel(nn.Module):
 
         # ----- Multi-expert MoE-style parallel forward -----
         if self._has_experts:
+            # CUDA graph capture cannot handle dynamic ops like torch.unique()
+            # in _forward_moe(). During capture we always use the default expert
+            # so the captured graph records a fixed computation path.
+            # At replay time, the worker layer detects mixed-profile batches
+            # and falls back to eager mode where _forward_moe() runs normally.
+            if torch.cuda.is_current_stream_capturing():
+                return self._forward_single_expert(
+                    self._default_profile_idx,
+                    positions,
+                    embeds,
+                    hidden_states,
+                    forward_batch,
+                )
             return self._forward_moe(
                 input_ids, positions, forward_batch, embeds, hidden_states
             )
@@ -352,6 +366,118 @@ class LlamaModel(nn.Module):
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
 
+    @staticmethod
+    def _can_extract_sub_metadata(forward_metadata) -> bool:
+        """Check whether the attention metadata supports sub-batch extraction.
+
+        Currently only the Triton backend's ``ForwardMetadata`` (which exposes
+        ``kv_indptr`` / ``kv_indices`` as plain tensors) can be efficiently
+        sliced.  Other backends (FlashInfer, FA3, …) store their indexing
+        state inside opaque wrapper objects, so we must fall back to the
+        full-batch-per-expert path for those.
+        """
+        return (
+            forward_metadata is not None
+            and hasattr(forward_metadata, "kv_indptr")
+            and hasattr(forward_metadata, "kv_indices")
+        )
+
+    @staticmethod
+    def _build_expert_sub_metadatas(
+        full_metadata,
+        expert_indices: "List[Optional[torch.Tensor]]",
+        expert_indices_cpu: "List[Optional[List[int]]]",
+        device: torch.device,
+    ) -> "List[Optional[object]]":
+        """Pre-compute sub-batch ``ForwardMetadata`` for *all* experts.
+
+        Designed to minimise GPU→CPU synchronisation:
+
+        * A single ``kv_indptr.tolist()`` transfers the full CSR to CPU.
+        * Per-expert CSR construction uses the CPU-side index lists
+          (``expert_indices_cpu``) directly — **zero** per-expert GPU→CPU
+          transfers.
+        * ``kv_indices`` gathering uses one ``torch.cat`` of GPU slices
+          per expert (no CPU readback of indices).
+
+        Args:
+            expert_indices: GPU tensors of token indices per expert.
+            expert_indices_cpu: Parallel CPU lists (avoids x_idx.tolist()).
+        """
+        from sglang.srt.layers.attention.triton_backend import ForwardMetadata
+
+        full_kv_indptr = full_metadata.kv_indptr  # [full_bs + 1]
+        full_kv_indices = full_metadata.kv_indices  # [total_kv_entries]
+
+        # Single bulk GPU→CPU transfer (the only sync point)
+        full_kv_indptr_cpu = full_kv_indptr.tolist()
+
+        results: List[Optional[object]] = []
+        for x_idx, x_idx_cpu in zip(expert_indices, expert_indices_cpu):
+            if x_idx is None:
+                results.append(None)
+                continue
+
+            n_sub = len(x_idx_cpu)
+
+            # Build CSR boundaries from the CPU copies (zero GPU ops)
+            starts_cpu = [full_kv_indptr_cpu[i] for i in x_idx_cpu]
+            ends_cpu = [full_kv_indptr_cpu[i + 1] for i in x_idx_cpu]
+            lengths_cpu = [e - s for s, e in zip(starts_cpu, ends_cpu)]
+
+            # Upload compact CSR to GPU in one shot
+            cumsum = list(itertools.accumulate(lengths_cpu, initial=0))
+            sub_kv_indptr = torch.tensor(
+                cumsum, dtype=full_kv_indptr.dtype, device=device
+            )
+
+            # Gather kv_indices: Python-level slicing of GPU tensor
+            total = cumsum[-1]
+            if total > 0:
+                sub_kv_indices = torch.cat(
+                    [full_kv_indices[s:e] for s, e in zip(starts_cpu, ends_cpu)]
+                )
+            else:
+                sub_kv_indices = torch.empty(
+                    0, dtype=full_kv_indices.dtype, device=device
+                )
+
+            sub_attn_logits = (
+                full_metadata.attn_logits[:n_sub]
+                if full_metadata.attn_logits is not None
+                else None
+            )
+            sub_attn_lse = (
+                full_metadata.attn_lse[:n_sub]
+                if full_metadata.attn_lse is not None
+                else None
+            )
+            sub_num_kv_splits = (
+                full_metadata.num_kv_splits[x_idx]
+                if full_metadata.num_kv_splits is not None
+                else None
+            )
+
+            results.append(
+                ForwardMetadata(
+                    attn_logits=sub_attn_logits,
+                    attn_lse=sub_attn_lse,
+                    max_extend_len=full_metadata.max_extend_len,
+                    num_kv_splits=sub_num_kv_splits,
+                    kv_indptr=sub_kv_indptr,
+                    kv_indices=sub_kv_indices,
+                    qo_indptr=full_metadata.qo_indptr,
+                    custom_mask=full_metadata.custom_mask,
+                    mask_indptr=full_metadata.mask_indptr,
+                    window_kv_indptr=full_metadata.window_kv_indptr,
+                    window_kv_indices=full_metadata.window_kv_indices,
+                    window_num_kv_splits=full_metadata.window_num_kv_splits,
+                    window_kv_offsets=full_metadata.window_kv_offsets,
+                )
+            )
+
+        return results
+
     def _forward_moe(
         self,
         input_ids: torch.Tensor,
@@ -360,32 +486,119 @@ class LlamaModel(nn.Module):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
-        """MoE-style forward: each expert processes ALL tokens, then we
-        select per-token outputs based on profile routing.
+        """MoE-style forward: route tokens to per-expert sub-networks.
 
-        Each expert's midlayer has a unique layer_id, so KV caches are independent.
-        The "wasted" compute (processing tokens belonging to other profiles) is
-        acceptable because EAGLE3 has only 1 decoder layer.
+        Two execution modes are supported depending on the attention backend:
+
+        **Sub-batch mode** (Triton backend – preferred):
+          Each expert processes *only* its own tokens through
+          FC → midlayer (attention + MLP) → norm.  We temporarily replace
+          ``forward_batch.attn_backend.forward_metadata`` with a sub-batch
+          version built from the full-batch CSR (``kv_indptr``/``kv_indices``).
+          Total work is proportional to 1× batch size.
+
+          All sub-batch metadatas are pre-built *before* the expert loop
+          via ``_build_expert_sub_metadatas`` so that the single GPU→CPU
+          transfer (``kv_indptr.tolist()``) is amortised across experts.
+
+        **Full-batch mode** (FlashInfer / other backends – fallback):
+          These backends store attention metadata inside opaque wrappers that
+          cannot be sliced.  Each expert therefore runs the midlayer on the
+          **full batch** (to keep kv_indptr/kv_indices consistent), and we
+          only scatter the expert's own tokens from the output.  FC and norm
+          are still computed on the expert's subset only.
         """
-        profile_ids = self._get_profile_ids(forward_batch)  # [num_tokens]
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
 
-        # If all tokens belong to one profile, fast-path: just use that expert
-        if profile_ids is not None:
-            unique_profiles = profile_ids.unique()
-            if len(unique_profiles) == 1:
-                idx = unique_profiles.item()
-                return self._forward_single_expert(
-                    idx, positions, embeds, hidden_states, forward_batch
-                )
+        # ----- Build per-expert token indices entirely on CPU -----
+        # This avoids all GPU→CPU synchronisations (unique, mask.any,
+        # nonzero) that would otherwise stall the pipeline.
+        expert_indices_cpu: List[Optional[List[int]]] = [
+            None for _ in range(self._num_experts)
+        ]
+        active_count = 0
+        single_expert_idx = -1
 
-        # Need fc first (since it may change hidden_size)
+        custom_params_list = None
+        if (
+            forward_batch.sampling_info is not None
+            and forward_batch.sampling_info.custom_params is not None
+        ):
+            custom_params_list = forward_batch.sampling_info.custom_params
+
+        if custom_params_list is not None:
+            num_reqs = len(custom_params_list)
+            profile_name_to_idx = {
+                name: i for i, name in enumerate(self._profile_names)
+            }
+
+            # Determine per-request expert index (CPU only)
+            req_experts: List[int] = []
+            for cp in custom_params_list:
+                if isinstance(cp, dict):
+                    p = cp.get("eagle_draft_profile")
+                    if p is not None and p in profile_name_to_idx:
+                        req_experts.append(profile_name_to_idx[p])
+                    else:
+                        req_experts.append(self._default_profile_idx)
+                else:
+                    req_experts.append(self._default_profile_idx)
+
+            # Expand per-request → per-token indices
+            if num_tokens > num_reqs and num_tokens % num_reqs == 0:
+                topk = num_tokens // num_reqs
+            elif num_tokens == num_reqs:
+                topk = 1
+            else:
+                topk = 1
+
+            # Bucket token indices by expert (pure Python, zero GPU ops)
+            buckets: List[List[int]] = [[] for _ in range(self._num_experts)]
+            for req_idx, eidx in enumerate(req_experts):
+                base = req_idx * topk
+                for t in range(topk):
+                    buckets[eidx].append(base + t)
+
+            for eidx in range(self._num_experts):
+                if buckets[eidx]:
+                    expert_indices_cpu[eidx] = buckets[eidx]
+                    active_count += 1
+                    single_expert_idx = eidx
+        else:
+            # No custom_params → all tokens use default expert
+            expert_indices_cpu[self._default_profile_idx] = list(range(num_tokens))
+            active_count = 1
+            single_expert_idx = self._default_profile_idx
+
+        # Fast-path: all tokens share one profile
+        if active_count <= 1:
+            return self._forward_single_expert(
+                (
+                    single_expert_idx
+                    if single_expert_idx >= 0
+                    else self._default_profile_idx
+                ),
+                positions,
+                embeds,
+                hidden_states,
+                forward_batch,
+            )
+
+        # Upload indices to GPU (one tensor per expert, single sync point)
+        expert_indices: List[Optional[torch.Tensor]] = []
+        for cpu_idx in expert_indices_cpu:
+            if cpu_idx is not None:
+                expert_indices.append(
+                    torch.tensor(cpu_idx, dtype=torch.long, device=device)
+                )
+            else:
+                expert_indices.append(None)
+
         need_fc = hidden_states.shape[-1] != embeds.shape[-1]
+        hidden_dim = self.config.hidden_size
 
         # Allocate output buffers
-        # We'll fill them from each expert
-        hidden_dim = self.config.hidden_size
         hs_logits_out = torch.empty(
             num_tokens, hidden_dim, device=device, dtype=embeds.dtype
         )
@@ -393,36 +606,92 @@ class LlamaModel(nn.Module):
             num_tokens, hidden_dim, device=device, dtype=embeds.dtype
         )
 
-        # Process each expert on ALL tokens, but only keep the relevant outputs
-        for expert_idx in range(self._num_experts):
-            # Check if any token needs this expert
-            mask = profile_ids == expert_idx
-            if not mask.any():
-                continue
+        # Determine execution mode and pre-build sub-batch metadatas
+        attn_backend = forward_batch.attn_backend
+        orig_forward_metadata = (
+            attn_backend.forward_metadata if attn_backend is not None else None
+        )
+        use_sub_batch = self._can_extract_sub_metadata(orig_forward_metadata)
 
-            # FC
-            if need_fc:
-                hs_expert = self.fc_experts[expert_idx](hidden_states)
-            else:
-                hs_expert = hidden_states
-
-            # Midlayer (attention + MLP) — processes ALL tokens
-            # Each expert has its own layer_id, so KV cache is independent
-            residual = None
-            hs_expert, residual = self.midlayer_experts[expert_idx](
-                positions,
-                embeds,
-                hs_expert,
-                forward_batch,
-                residual,
+        # Pre-build all expert sub-metadatas OUTSIDE the loop so that the
+        # GPU→CPU transfer (kv_indptr.tolist()) happens once in bulk.
+        sub_metadatas: List[Optional[object]] = [None] * self._num_experts
+        if use_sub_batch:
+            sub_metadatas = self._build_expert_sub_metadatas(
+                orig_forward_metadata, expert_indices, expert_indices_cpu, device
             )
 
-            # Norm
-            hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](hs_expert, residual)
+        # Save originals that we will temporarily mutate
+        orig_out_cache_loc = forward_batch.out_cache_loc
 
-            # Only keep outputs for tokens belonging to this expert
-            hs_logits_out[mask] = hs_to_logits[mask]
-            hs_aux_out[mask] = hs_to_aux[mask]
+        for expert_idx in range(self._num_experts):
+            x_idx = expert_indices[expert_idx]
+            if x_idx is None:
+                continue
+
+            if use_sub_batch:
+                # ---- Sub-batch mode (Triton) ----
+                if need_fc:
+                    expert_hs = self.fc_experts[expert_idx](hidden_states[x_idx])
+                else:
+                    expert_hs = hidden_states[x_idx]
+
+                expert_embeds = embeds[x_idx]
+                expert_positions = positions[x_idx]
+
+                if orig_out_cache_loc is not None:
+                    forward_batch.out_cache_loc = orig_out_cache_loc[x_idx]
+
+                # Swap in the pre-computed sub-batch metadata
+                attn_backend.forward_metadata = sub_metadatas[expert_idx]
+
+                residual = None
+                hs_expert_out, residual = self.midlayer_experts[expert_idx](
+                    expert_positions,
+                    expert_embeds,
+                    expert_hs,
+                    forward_batch,
+                    residual,
+                )
+
+                hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](
+                    hs_expert_out, residual
+                )
+
+                hs_logits_out[x_idx] = hs_to_logits
+                hs_aux_out[x_idx] = hs_to_aux
+            else:
+                # ---- Full-batch mode (FlashInfer / others) ----
+                if need_fc:
+                    expert_hs = self.fc_experts[expert_idx](hidden_states[x_idx])
+                    hs_full = torch.zeros(
+                        num_tokens, hidden_dim, device=device, dtype=embeds.dtype
+                    )
+                    hs_full[x_idx] = expert_hs
+                else:
+                    hs_full = hidden_states
+
+                # Midlayer: full batch (attention metadata is opaque)
+                residual = None
+                hs_expert, residual = self.midlayer_experts[expert_idx](
+                    positions,
+                    embeds,
+                    hs_full,
+                    forward_batch,
+                    residual,
+                )
+
+                # Norm + scatter only this expert's tokens
+                hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](
+                    hs_expert, residual
+                )
+                hs_logits_out[x_idx] = hs_to_logits[x_idx]
+                hs_aux_out[x_idx] = hs_to_aux[x_idx]
+
+        # Restore originals
+        forward_batch.out_cache_loc = orig_out_cache_loc
+        if attn_backend is not None:
+            attn_backend.forward_metadata = orig_forward_metadata
 
         return hs_logits_out, [hs_aux_out]
 
@@ -654,6 +923,17 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                # During CUDA graph capture, _moe_logits() calls
+                # profile_ids.unique() which is not supported.
+                # Use the default expert lm_head for a fixed compute path.
+                if torch.cuda.is_current_stream_capturing():
+                    return self.logits_processor(
+                        input_ids,
+                        hidden_states,
+                        self.lm_head_experts[self.model._default_profile_idx],
+                        forward_batch,
+                        aux_hidden_states,
+                    )
                 # MoE logits: route to different lm_heads per token
                 return self._moe_logits(
                     input_ids, hidden_states, forward_batch, aux_hidden_states
@@ -672,30 +952,68 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     ) -> LogitsProcessorOutput:
         """Compute logits using per-token expert lm_heads.
 
-        If all tokens share the same profile, use the fast path.
-        Otherwise, compute logits for each expert and scatter.
+        Uses CPU-side routing (same logic as ``_forward_moe``) to avoid
+        GPU→CPU synchronisations in the hot path.
         """
-        profile_ids = self.model._get_profile_ids(forward_batch)
+        num_tokens = hidden_states.shape[0]
+        device = hidden_states.device
 
-        if profile_ids is not None:
-            unique_profiles = profile_ids.unique()
-            if len(unique_profiles) == 1:
-                # Fast path: single expert
-                idx = unique_profiles.item()
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head_experts[idx],
-                    forward_batch,
-                    aux_hidden_states,
-                )
+        # ---- CPU-side routing (zero GPU sync) ----
+        custom_params_list = None
+        if (
+            forward_batch.sampling_info is not None
+            and forward_batch.sampling_info.custom_params is not None
+        ):
+            custom_params_list = forward_batch.sampling_info.custom_params
 
-        # Mixed profiles: compute logits per expert and merge
-        # This is trickier because logits_processor returns a LogitsProcessorOutput
-        # We need to run the full pipeline for all tokens, then overwrite per-expert
-        #
-        # Strategy: run logits_processor with default lm_head first to get the output
-        # structure, then overwrite next_token_logits per-expert.
+        expert_buckets: List[Optional[List[int]]] = [
+            None for _ in range(self._num_experts)
+        ]
+        active_count = 0
+        single_expert_idx = self._default_profile_idx
+
+        if custom_params_list is not None:
+            num_reqs = len(custom_params_list)
+            profile_name_to_idx = {
+                name: i for i, name in enumerate(self.model._profile_names)
+            }
+            if num_tokens > num_reqs and num_tokens % num_reqs == 0:
+                topk = num_tokens // num_reqs
+            else:
+                topk = 1
+
+            buckets: List[List[int]] = [[] for _ in range(self._num_experts)]
+            for req_idx, cp in enumerate(custom_params_list):
+                eidx = self._default_profile_idx
+                if isinstance(cp, dict):
+                    p = cp.get("eagle_draft_profile")
+                    if p is not None and p in profile_name_to_idx:
+                        eidx = profile_name_to_idx[p]
+                base = req_idx * topk
+                for t in range(topk):
+                    buckets[eidx].append(base + t)
+
+            for eidx in range(self._num_experts):
+                if buckets[eidx]:
+                    expert_buckets[eidx] = buckets[eidx]
+                    active_count += 1
+                    single_expert_idx = eidx
+        else:
+            expert_buckets[self._default_profile_idx] = list(range(num_tokens))
+            active_count = 1
+
+        # Fast path: single expert
+        if active_count <= 1:
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head_experts[single_expert_idx],
+                forward_batch,
+                aux_hidden_states,
+            )
+
+        # --- Mixed profiles ---
+        # Step 1: full logits_processor with default lm_head
         result = self.logits_processor(
             input_ids,
             hidden_states,
@@ -704,23 +1022,30 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             aux_hidden_states,
         )
 
-        # Now overwrite logits for non-default experts
+        # Step 2: for each non-default expert, compute lm_head on its tokens
         for expert_idx in range(self._num_experts):
             if expert_idx == self._default_profile_idx:
                 continue
-            mask = profile_ids == expert_idx
-            if not mask.any():
+
+            cpu_idx = expert_buckets[expert_idx]
+            if cpu_idx is None:
                 continue
 
-            # Compute logits for this expert's tokens
-            expert_result = self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head_experts[expert_idx],
-                forward_batch,
-                aux_hidden_states,
+            x_idx = torch.tensor(cpu_idx, dtype=torch.long, device=device)
+
+            expert_hidden = hidden_states[x_idx]
+            lm_head = self.lm_head_experts[expert_idx]
+
+            if hasattr(lm_head, "weight"):
+                expert_logits = torch.matmul(
+                    expert_hidden.to(lm_head.weight.dtype), lm_head.weight.T
+                )
+            else:
+                expert_logits = lm_head.quant_method.apply(lm_head, expert_hidden, None)
+
+            result.next_token_logits[x_idx] = expert_logits.to(
+                result.next_token_logits.dtype
             )
-            result.next_token_logits[mask] = expert_result.next_token_logits[mask]
 
         return result
 
