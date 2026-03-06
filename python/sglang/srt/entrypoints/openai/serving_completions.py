@@ -158,9 +158,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if request.eagle_draft_profile is not None:
             if sampling_params["custom_params"] is None:
                 sampling_params["custom_params"] = {}
-            sampling_params["custom_params"]["eagle_draft_profile"] = (
-                request.eagle_draft_profile
-            )
+            sampling_params["custom_params"][
+                "eagle_draft_profile"
+            ] = request.eagle_draft_profile
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":

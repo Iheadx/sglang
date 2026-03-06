@@ -196,18 +196,22 @@ class LlamaModel(nn.Module):
                     self.hidden_size_in * 3,
                     config.hidden_size,
                     bias=getattr(config, "bias", False),
-                ).to(device=next(self.fc.parameters()).device,
-                     dtype=next(self.fc.parameters()).dtype)
+                ).to(
+                    device=next(self.fc.parameters()).device,
+                    dtype=next(self.fc.parameters()).dtype,
+                )
 
                 new_mid = LlamaDecoderLayer(
                     config, layer_id=i, quant_config=quant_config, prefix=prefix
-                ).to(device=next(self.midlayer.parameters()).device,
-                     dtype=next(self.midlayer.parameters()).dtype)
+                ).to(
+                    device=next(self.midlayer.parameters()).device,
+                    dtype=next(self.midlayer.parameters()).dtype,
+                )
 
-                new_norm = RMSNorm(
-                    config.hidden_size, eps=config.rms_norm_eps
-                ).to(device=next(self.norm.parameters()).device,
-                     dtype=next(self.norm.parameters()).dtype)
+                new_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(
+                    device=next(self.norm.parameters()).device,
+                    dtype=next(self.norm.parameters()).dtype,
+                )
 
                 fc_list.append(new_fc)
                 mid_list.append(new_mid)
@@ -247,8 +251,10 @@ class LlamaModel(nn.Module):
         if custom_params_list is None:
             # All tokens use default profile
             return torch.full(
-                (num_tokens,), self._default_profile_idx,
-                dtype=torch.long, device=forward_batch.input_ids.device
+                (num_tokens,),
+                self._default_profile_idx,
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
             )
 
         # Build per-request profile index
@@ -269,8 +275,7 @@ class LlamaModel(nn.Module):
                 req_profile_ids.append(self._default_profile_idx)
 
         req_profile_tensor = torch.tensor(
-            req_profile_ids, dtype=torch.long,
-            device=forward_batch.input_ids.device
+            req_profile_ids, dtype=torch.long, device=forward_batch.input_ids.device
         )
 
         # Expand from per-request to per-token
@@ -291,8 +296,10 @@ class LlamaModel(nn.Module):
         else:
             # Fallback: use default for all
             return torch.full(
-                (num_tokens,), self._default_profile_idx,
-                dtype=torch.long, device=forward_batch.input_ids.device
+                (num_tokens,),
+                self._default_profile_idx,
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
             )
 
     def forward(
@@ -411,9 +418,7 @@ class LlamaModel(nn.Module):
             )
 
             # Norm
-            hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](
-                hs_expert, residual
-            )
+            hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](hs_expert, residual)
 
             # Only keep outputs for tokens belonging to this expert
             hs_logits_out[mask] = hs_to_logits[mask]
@@ -442,9 +447,7 @@ class LlamaModel(nn.Module):
             residual,
         )
 
-        hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](
-            hidden_states, residual
-        )
+        hs_to_logits, hs_to_aux = self.norm_experts[expert_idx](hidden_states, residual)
 
         return hs_to_logits, [hs_to_aux]
 
@@ -541,8 +544,10 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         self.config.draft_vocab_size,
                         self.config.hidden_size,
                         quant_config=self.quant_config,
-                    ).to(device=next(self.lm_head.parameters()).device,
-                         dtype=next(self.lm_head.parameters()).dtype)
+                    ).to(
+                        device=next(self.lm_head.parameters()).device,
+                        dtype=next(self.lm_head.parameters()).dtype,
+                    )
                     lm_head_list.append(new_lm_head)
 
         self.lm_head_experts = nn.ModuleList(lm_head_list)
@@ -555,9 +560,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             quant_config=self.quant_config,
         )
 
-        logger.info(
-            f"LlamaForCausalLMEagle3 registered {n} experts: {profile_names}"
-        )
+        logger.info(f"LlamaForCausalLMEagle3 registered {n} experts: {profile_names}")
 
     def _extract_own_profile_weights(self) -> Dict[str, torch.Tensor]:
         """Extract (clone) the current model weights that are profile-specific."""
@@ -680,8 +683,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 # Fast path: single expert
                 idx = unique_profiles.item()
                 return self.logits_processor(
-                    input_ids, hidden_states, self.lm_head_experts[idx],
-                    forward_batch, aux_hidden_states,
+                    input_ids,
+                    hidden_states,
+                    self.lm_head_experts[idx],
+                    forward_batch,
+                    aux_hidden_states,
                 )
 
         # Mixed profiles: compute logits per expert and merge
@@ -691,8 +697,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         # Strategy: run logits_processor with default lm_head first to get the output
         # structure, then overwrite next_token_logits per-expert.
         result = self.logits_processor(
-            input_ids, hidden_states, self.lm_head_experts[self._default_profile_idx],
-            forward_batch, aux_hidden_states,
+            input_ids,
+            hidden_states,
+            self.lm_head_experts[self._default_profile_idx],
+            forward_batch,
+            aux_hidden_states,
         )
 
         # Now overwrite logits for non-default experts
@@ -705,8 +714,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             # Compute logits for this expert's tokens
             expert_result = self.logits_processor(
-                input_ids, hidden_states, self.lm_head_experts[expert_idx],
-                forward_batch, aux_hidden_states,
+                input_ids,
+                hidden_states,
+                self.lm_head_experts[expert_idx],
+                forward_batch,
+                aux_hidden_states,
             )
             result.next_token_logits[mask] = expert_result.next_token_logits[mask]
 

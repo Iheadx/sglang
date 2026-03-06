@@ -2689,14 +2689,28 @@ class ServerArgs:
             if self.speculative_draft_model_config is not None:
                 try:
                     import json as _json
+
                     with open(self.speculative_draft_model_config, "r") as _f:
                         _draft_cfg = _json.load(_f)
-                    if "speculative_num_steps" in _draft_cfg and self.speculative_num_steps is None:
+                    if (
+                        "speculative_num_steps" in _draft_cfg
+                        and self.speculative_num_steps is None
+                    ):
                         self.speculative_num_steps = _draft_cfg["speculative_num_steps"]
-                    if "speculative_eagle_topk" in _draft_cfg and self.speculative_eagle_topk is None:
-                        self.speculative_eagle_topk = _draft_cfg["speculative_eagle_topk"]
-                    if "speculative_num_draft_tokens" in _draft_cfg and self.speculative_num_draft_tokens is None:
-                        self.speculative_num_draft_tokens = _draft_cfg["speculative_num_draft_tokens"]
+                    if (
+                        "speculative_eagle_topk" in _draft_cfg
+                        and self.speculative_eagle_topk is None
+                    ):
+                        self.speculative_eagle_topk = _draft_cfg[
+                            "speculative_eagle_topk"
+                        ]
+                    if (
+                        "speculative_num_draft_tokens" in _draft_cfg
+                        and self.speculative_num_draft_tokens is None
+                    ):
+                        self.speculative_num_draft_tokens = _draft_cfg[
+                            "speculative_num_draft_tokens"
+                        ]
                     # Use the first profile's draft_model_path as the default if not set
                     if self.speculative_draft_model_path is None:
                         _default_name = _draft_cfg.get("default_profile", "default")
@@ -2705,7 +2719,9 @@ class ServerArgs:
                             _path = _profiles[_default_name].get("draft_model_path")
                             if _path:
                                 self.speculative_draft_model_path = _path
-                                logger.info(f"Using draft model path from config: {_path}")
+                                logger.info(
+                                    f"Using draft model path from config: {_path}"
+                                )
                 except Exception as e:
                     logger.error(f"Failed to load draft model config: {e}")
 

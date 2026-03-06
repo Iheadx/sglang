@@ -789,9 +789,9 @@ class ChatCompletionRequest(BaseModel):
         if self.eagle_draft_profile is not None:
             if sampling_params["custom_params"] is None:
                 sampling_params["custom_params"] = {}
-            sampling_params["custom_params"]["eagle_draft_profile"] = (
-                self.eagle_draft_profile
-            )
+            sampling_params["custom_params"][
+                "eagle_draft_profile"
+            ] = self.eagle_draft_profile
 
         if self.response_format and self.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(

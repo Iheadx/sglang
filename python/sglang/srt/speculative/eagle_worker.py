@@ -257,7 +257,9 @@ class EAGLEWorker(TpModelWorker):
         profiles = profiles_config.get("profiles", {})
 
         if not profiles:
-            logger.warning("No profiles found in config file. Skipping multi-expert init.")
+            logger.warning(
+                "No profiles found in config file. Skipping multi-expert init."
+            )
             return
 
         model = self.draft_model_runner.model
@@ -292,7 +294,9 @@ class EAGLEWorker(TpModelWorker):
         # Step 2: Load weights for non-default experts
         for i, profile_name in enumerate(profile_names):
             if i == default_idx:
-                logger.info(f"Expert {i} ('{profile_name}'): uses already-loaded default weights")
+                logger.info(
+                    f"Expert {i} ('{profile_name}'): uses already-loaded default weights"
+                )
                 continue
 
             profile_cfg = profiles.get(profile_name, {})
@@ -311,7 +315,9 @@ class EAGLEWorker(TpModelWorker):
             weights = self._load_profile_weights(draft_model_path, server_args)
             if weights is not None:
                 model.load_expert_weights(i, weights)
-                logger.info(f"Expert {i} ('{profile_name}'): weights loaded successfully")
+                logger.info(
+                    f"Expert {i} ('{profile_name}'): weights loaded successfully"
+                )
             else:
                 logger.error(
                     f"Expert {i} ('{profile_name}'): failed to load weights, using default"
@@ -327,6 +333,7 @@ class EAGLEWorker(TpModelWorker):
         if extra_layers > 0:
             kv_pool = self.draft_model_runner.token_to_kv_pool
             from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
             if isinstance(kv_pool, MHATokenToKVPool):
                 kv_pool.extend_layers(extra_layers)
                 logger.info(
