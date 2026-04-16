@@ -4405,7 +4405,6 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
-        
 
         # Speculative decoding (ngram)
         parser.add_argument(
